@@ -1,0 +1,200 @@
+name: HLS Stream Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream_url:
+        description: "M3U8 stream URL"
+        required: true
+        type: string
+
+      cookie:
+        description: "Optional Cookie header (leave empty if not needed)"
+        required: false
+        type: string
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Check M3U8
+        env:
+          STREAM_URL: ${{ inputs.stream_url }}
+          COOKIE: ${{ inputs.cookie }}
+        run: |
+          set -u
+
+          echo "======================================"
+          echo "        HLS STREAM DIAGNOSTIC"
+          echo "======================================"
+          echo
+
+          echo "URL:"
+          echo "$STREAM_URL"
+          echo
+
+          echo "--------------------------------------"
+          echo "1. Testing HTTP response"
+          echo "--------------------------------------"
+
+          if [ -n "$COOKIE" ]; then
+            curl_args=(-L --max-time 20 -sS \
+              -H "User-Agent: Mozilla/5.0" \
+              -H "Origin: https://example.com" \
+              -H "Referer: https://example.com/" \
+              -H "Cookie: $COOKIE" \
+              -D headers.txt \
+              -o playlist.m3u8 \
+              "$STREAM_URL")
+          else
+            curl_args=(-L --max-time 20 -sS \
+              -H "User-Agent: Mozilla/5.0" \
+              -H "Origin: https://example.com" \
+              -H "Referer: https://example.com/" \
+              -D headers.txt \
+              -o playlist.m3u8 \
+              "$STREAM_URL")
+          fi
+
+          if ! curl "${curl_args[@]}"; then
+            echo "❌ Request failed completely."
+            exit 1
+          fi
+
+          echo
+          echo "Response headers:"
+          cat headers.txt
+          echo
+
+          echo "--------------------------------------"
+          echo "2. HTTP status"
+          echo "--------------------------------------"
+
+          STATUS=$(awk 'toupper($1) ~ /^HTTP\// {code=$2} END {print code}' headers.txt)
+
+          echo "HTTP Status: $STATUS"
+
+          case "$STATUS" in
+            2*)
+              echo "✅ HTTP request successful"
+              ;;
+            3*)
+              echo "⚠️ Redirect response"
+              ;;
+            401)
+              echo "❌ 401 Unauthorized"
+              ;;
+            403)
+              echo "❌ 403 Forbidden"
+              ;;
+            404)
+              echo "❌ 404 Not Found"
+              ;;
+            *)
+              echo "❌ HTTP request returned an error"
+              ;;
+          esac
+
+          echo
+          echo "--------------------------------------"
+          echo "3. Content-Type"
+          echo "--------------------------------------"
+
+          CONTENT_TYPE=$(grep -i "^content-type:" headers.txt | tail -1 || true)
+
+          echo "$CONTENT_TYPE"
+
+          if echo "$CONTENT_TYPE" | grep -qiE "mpegurl|vnd.apple.mpegurl|application/x-mpegURL"; then
+            echo "✅ Looks like an HLS playlist Content-Type"
+          else
+            echo "⚠️ Content-Type may not be an HLS MIME type"
+          fi
+
+          echo
+          echo "--------------------------------------"
+          echo "4. CORS"
+          echo "--------------------------------------"
+
+          CORS=$(grep -i "^access-control-allow-origin:" headers.txt | tail -1 || true)
+
+          if [ -n "$CORS" ]; then
+            echo "CORS header:"
+            echo "$CORS"
+
+            if echo "$CORS" | grep -q "\*"; then
+              echo "✅ Access-Control-Allow-Origin: *"
+            else
+              echo "⚠️ CORS is restricted to a specific origin"
+            fi
+          else
+            echo "❌ Access-Control-Allow-Origin header NOT FOUND"
+            echo
+            echo "This can prevent browser-based HLS players from loading the stream."
+          fi
+
+          echo
+          echo "--------------------------------------"
+          echo "5. Playlist validation"
+          echo "--------------------------------------"
+
+          if [ ! -s playlist.m3u8 ]; then
+            echo "❌ Playlist is empty."
+          elif grep -q "#EXTM3U" playlist.m3u8; then
+            echo "✅ Valid-looking HLS playlist (#EXTM3U found)"
+          else
+            echo "❌ #EXTM3U not found"
+            echo
+            echo "First 20 lines:"
+            head -20 playlist.m3u8
+          fi
+
+          echo
+          echo "--------------------------------------"
+          echo "6. Playlist type"
+          echo "--------------------------------------"
+
+          if grep -q "#EXT-X-STREAM-INF" playlist.m3u8; then
+            echo "📺 Master playlist detected"
+            echo "Contains multiple quality/variant streams."
+          elif grep -q "#EXTINF" playlist.m3u8; then
+            echo "🎬 Media playlist detected"
+            echo "Contains media segments."
+          else
+            echo "⚠️ Could not identify playlist type."
+          fi
+
+          echo
+          echo "--------------------------------------"
+          echo "7. Playlist preview"
+          echo "--------------------------------------"
+
+          sed -n '1,30p' playlist.m3u8
+
+          echo
+          echo "--------------------------------------"
+          echo "8. Basic diagnosis"
+          echo "--------------------------------------"
+
+          if [ "$STATUS" = "403" ]; then
+            echo "🔴 LIKELY: Access authorization / expired token / cookie"
+          elif [ "$STATUS" = "401" ]; then
+            echo "🔴 LIKELY: Authentication required"
+          elif [ -z "$CORS" ]; then
+            echo "🟠 LIKELY: Browser CORS restriction"
+          elif ! grep -q "#EXTM3U" playlist.m3u8; then
+            echo "🔴 LIKELY: Response is not a valid HLS playlist"
+          else
+            echo "🟢 M3U8 endpoint looks accessible and playlist-like."
+            echo "Further segment-level testing may be required."
+          fi
+
+          echo
+          echo "======================================"
+          echo "Diagnostic completed"
+          echo "======================================"
