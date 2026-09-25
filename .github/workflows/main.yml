@@ -1,4 +1,4 @@
-name: Toffee API Output Tester
+name: Toffee Playback API Test
 
 on:
   workflow_dispatch:
@@ -7,70 +7,73 @@ permissions:
   contents: read
 
 jobs:
-  test-api:
+  api-test:
     runs-on: ubuntu-latest
 
     env:
-      API_URL: "https://entitlement-prod.services.toffeelive.com/toffee/BD/DK/web/playback/wHLVIJ4B7a1HdMSjaGLJ"
+      API_URL: "https://entitlement-prod.services.toffeelive.com/toffee/BD/DK/web/playback/kK2aX5UBrjBfS2_RBcKf"
 
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y jq
 
-      - name: Test API
-        shell: bash
+      - name: Call Playback API
+        env:
+          TOFFEE_TOKEN: ${{ secrets.TOFFEE_TOKEN }}
         run: |
           set +e
 
           echo "======================================"
-          echo "        TOFFEE API TEST"
+          echo "       TOFFEE PLAYBACK API TEST"
           echo "======================================"
-          echo "Endpoint:"
-          echo "$API_URL"
-          echo
-
-          echo "--------------------------------------"
-          echo "1. HTTP RESPONSE"
-          echo "--------------------------------------"
 
           curl -sS \
-            -D response_headers.txt \
-            -o response_body.txt \
-            -w "HTTP_STATUS=%{http_code}\nCONTENT_TYPE=%{content_type}\nSIZE=%{size_download}\nTIME=%{time_total}s\n" \
-            "$API_URL"
+            -X POST \
+            "$API_URL" \
+            -D headers.txt \
+            -o response.json \
+            -w "\nHTTP_STATUS=%{http_code}\nCONTENT_TYPE=%{content_type}\nSIZE=%{size_download}\nTIME=%{time_total}s\n" \
+            -H "Authorization: Bearer $TOFFEE_TOKEN" \
+            -H "Referer: https://toffeelive.com/" \
+            -H "User-Agent: Mozilla/5.0" \
+            -H "Content-Type: application/json"
 
           echo
-          echo "--------------------------------------"
-          echo "2. RESPONSE HEADERS"
-          echo "--------------------------------------"
+          echo "======================================"
+          echo "RESPONSE HEADERS"
+          echo "======================================"
 
-          cat response_headers.txt
-
-          echo
-          echo "--------------------------------------"
-          echo "3. RAW RESPONSE BODY"
-          echo "--------------------------------------"
-
-          cat response_body.txt
+          cat headers.txt
 
           echo
-          echo "--------------------------------------"
-          echo "4. JSON ANALYSIS"
-          echo "--------------------------------------"
+          echo "======================================"
+          echo "RAW RESPONSE"
+          echo "======================================"
 
-          if jq empty response_body.txt 2>/dev/null; then
+          cat response.json
+
+          echo
+          echo "======================================"
+          echo "JSON ANALYSIS"
+          echo "======================================"
+
+          if jq empty response.json 2>/dev/null; then
 
             echo "Valid JSON: YES"
             echo
 
             echo "Top-level type:"
-            jq -r 'type' response_body.txt
+            jq -r 'type' response.json
 
             echo
-            echo "Top-level keys:"
-            jq -r 'if type == "object" then keys[] else "(not an object)" end' response_body.txt
+            echo "Keys:"
+
+            jq -r '
+              if type == "object"
+              then keys[]
+              else "Not an object"
+              end
+            ' response.json
 
             echo
             echo "Field types:"
@@ -81,31 +84,14 @@ jobs:
                 to_entries[]
                 | "\(.key) -> \(.value | type)"
               else
-                "Response is not a JSON object"
+                "Not an object"
               end
-            ' response_body.txt
+            ' response.json
 
             echo
             echo "Pretty JSON:"
-            jq '.' response_body.txt
+            jq '.' response.json
 
           else
-
             echo "Valid JSON: NO"
-            echo
-            echo "Response appears to be plain text / HTML / empty."
-
           fi
-
-          echo
-          echo "--------------------------------------"
-          echo "5. RESPONSE SUMMARY"
-          echo "--------------------------------------"
-
-          STATUS=$(awk -F= '/HTTP_STATUS=/{print $2}' <(curl -sS -o /dev/null \
-            -w "HTTP_STATUS=%{http_code}\n" "$API_URL"))
-
-          echo "HTTP Status: $STATUS"
-
-          echo
-          echo "API testing finished."
