@@ -1,267 +1,111 @@
-name: HLS Stream Diagnostic
+name: Toffee API Output Tester
 
 on:
   workflow_dispatch:
-    inputs:
-      stream_url:
-        description: "Authorized M3U8 URL"
-        required: true
-        type: string
 
-      origin:
-        description: "Authorized player origin, e.g. https://hridoytv.top"
-        required: false
-        default: "https://hridoytv.top"
-        type: string
+permissions:
+  contents: read
 
 jobs:
-  diagnose:
+  test-api:
     runs-on: ubuntu-latest
+
+    env:
+      API_URL: "https://entitlement-prod.services.toffeelive.com/toffee/BD/DK/web/playback/wHLVIJ4B7a1HdMSjaGLJ"
 
     steps:
       - name: Install tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl
 
-      - name: Diagnose HLS stream
-        env:
-          STREAM_URL: ${{ inputs.stream_url }}
-          ORIGIN: ${{ inputs.origin }}
+      - name: Test API
+        shell: bash
         run: |
-          set -e
+          set +e
 
-          echo "=========================================="
-          echo "        HLS STREAM DIAGNOSTIC"
-          echo "=========================================="
+          echo "======================================"
+          echo "        TOFFEE API TEST"
+          echo "======================================"
+          echo "Endpoint:"
+          echo "$API_URL"
           echo
 
-          echo "Stream:"
-          echo "$STREAM_URL"
+          echo "--------------------------------------"
+          echo "1. HTTP RESPONSE"
+          echo "--------------------------------------"
+
+          curl -sS \
+            -D response_headers.txt \
+            -o response_body.txt \
+            -w "HTTP_STATUS=%{http_code}\nCONTENT_TYPE=%{content_type}\nSIZE=%{size_download}\nTIME=%{time_total}s\n" \
+            "$API_URL"
+
           echo
+          echo "--------------------------------------"
+          echo "2. RESPONSE HEADERS"
+          echo "--------------------------------------"
 
-          echo "Origin:"
-          echo "$ORIGIN"
+          cat response_headers.txt
+
           echo
+          echo "--------------------------------------"
+          echo "3. RAW RESPONSE BODY"
+          echo "--------------------------------------"
 
-          # --------------------------------------------------
-          # 1. Request M3U8
-          # --------------------------------------------------
+          cat response_body.txt
 
-          echo "------------------------------------------"
-          echo "1. M3U8 REQUEST"
-          echo "------------------------------------------"
-
-          curl -L \
-            --max-time 20 \
-            -sS \
-            -A "Mozilla/5.0" \
-            -H "Origin: $ORIGIN" \
-            -H "Referer: $ORIGIN/" \
-            -D m3u8_headers.txt \
-            -o playlist.m3u8 \
-            "$STREAM_URL"
-
-          echo "Response headers:"
-          cat m3u8_headers.txt
           echo
+          echo "--------------------------------------"
+          echo "4. JSON ANALYSIS"
+          echo "--------------------------------------"
 
-          STATUS=$(awk '
-            /^HTTP\// {code=$2}
-            END {print code}
-          ' m3u8_headers.txt)
+          if jq empty response_body.txt 2>/dev/null; then
 
-          echo "Final HTTP status: $STATUS"
-          echo
+            echo "Valid JSON: YES"
+            echo
 
-          # --------------------------------------------------
-          # 2. CORS
-          # --------------------------------------------------
+            echo "Top-level type:"
+            jq -r 'type' response_body.txt
 
-          echo "------------------------------------------"
-          echo "2. CORS"
-          echo "------------------------------------------"
+            echo
+            echo "Top-level keys:"
+            jq -r 'if type == "object" then keys[] else "(not an object)" end' response_body.txt
 
-          CORS=$(grep -i \
-            "access-control-allow-origin:" \
-            m3u8_headers.txt \
-            | tail -1 || true)
+            echo
+            echo "Field types:"
 
-          if [ -n "$CORS" ]; then
-            echo "✅ $CORS"
+            jq -r '
+              if type == "object"
+              then
+                to_entries[]
+                | "\(.key) -> \(.value | type)"
+              else
+                "Response is not a JSON object"
+              end
+            ' response_body.txt
+
+            echo
+            echo "Pretty JSON:"
+            jq '.' response_body.txt
+
           else
-            echo "❌ Access-Control-Allow-Origin not found"
+
+            echo "Valid JSON: NO"
+            echo
+            echo "Response appears to be plain text / HTML / empty."
+
           fi
 
           echo
+          echo "--------------------------------------"
+          echo "5. RESPONSE SUMMARY"
+          echo "--------------------------------------"
 
-          # --------------------------------------------------
-          # 3. Content Type
-          # --------------------------------------------------
+          STATUS=$(awk -F= '/HTTP_STATUS=/{print $2}' <(curl -sS -o /dev/null \
+            -w "HTTP_STATUS=%{http_code}\n" "$API_URL"))
 
-          echo "------------------------------------------"
-          echo "3. CONTENT TYPE"
-          echo "------------------------------------------"
-
-          CONTENT=$(grep -i \
-            "content-type:" \
-            m3u8_headers.txt \
-            | tail -1 || true)
-
-          echo "$CONTENT"
+          echo "HTTP Status: $STATUS"
 
           echo
-
-          # --------------------------------------------------
-          # 4. Playlist validation
-          # --------------------------------------------------
-
-          echo "------------------------------------------"
-          echo "4. PLAYLIST"
-          echo "------------------------------------------"
-
-          if grep -q "#EXTM3U" playlist.m3u8; then
-            echo "✅ #EXTM3U detected"
-          else
-            echo "❌ #EXTM3U NOT found"
-            echo
-            echo "Server response:"
-            head -30 playlist.m3u8
-            exit 1
-          fi
-
-          if grep -q "#EXT-X-STREAM-INF" playlist.m3u8; then
-            echo "📺 Master playlist"
-          elif grep -q "#EXTINF" playlist.m3u8; then
-            echo "🎬 Media playlist"
-          else
-            echo "⚠️ Playlist type could not be determined"
-          fi
-
-          echo
-
-          # --------------------------------------------------
-          # 5. Detect segments
-          # --------------------------------------------------
-
-          echo "------------------------------------------"
-          echo "5. MEDIA SEGMENTS"
-          echo "------------------------------------------"
-
-          grep -E '^https?://' playlist.m3u8 \
-            | head -3 \
-            > segments.txt || true
-
-          SEGMENT_COUNT=$(wc -l < segments.txt | tr -d ' ')
-
-          echo "Detected absolute media URLs: $SEGMENT_COUNT"
-          echo
-
-          if [ "$SEGMENT_COUNT" -eq 0 ]; then
-            echo "⚠️ No absolute URLs found."
-
-            echo
-            echo "Playlist:"
-            cat playlist.m3u8
-
-            exit 0
-          fi
-
-          # --------------------------------------------------
-          # 6. Test first 3 segments
-          # --------------------------------------------------
-
-          INDEX=0
-
-          while IFS= read -r SEGMENT
-          do
-            INDEX=$((INDEX + 1))
-
-            echo
-            echo "=========================================="
-            echo "SEGMENT #$INDEX"
-            echo "=========================================="
-
-            echo "$SEGMENT"
-            echo
-
-            curl \
-              -L \
-              --max-time 20 \
-              -sS \
-              -A "Mozilla/5.0" \
-              -H "Origin: $ORIGIN" \
-              -H "Referer: $ORIGIN/" \
-              -D "segment_${INDEX}_headers.txt" \
-              -o "segment_${INDEX}.bin" \
-              "$SEGMENT" || {
-                echo "❌ Segment request failed"
-                continue
-              }
-
-            SEG_STATUS=$(awk '
-              /^HTTP\// {code=$2}
-              END {print code}
-            ' "segment_${INDEX}_headers.txt")
-
-            SEG_SIZE=$(wc -c < "segment_${INDEX}.bin" | tr -d ' ')
-
-            echo "HTTP status: $SEG_STATUS"
-            echo "Size: $SEG_SIZE bytes"
-
-            echo
-            echo "Content-Type:"
-
-            grep -i \
-              "content-type:" \
-              "segment_${INDEX}_headers.txt" \
-              | tail -1 || echo "Not provided"
-
-            echo
-            echo "CORS:"
-
-            grep -i \
-              "access-control-allow-origin:" \
-              "segment_${INDEX}_headers.txt" \
-              | tail -1 || echo "Not provided"
-
-          done < segments.txt
-
-          # --------------------------------------------------
-          # 7. Diagnosis
-          # --------------------------------------------------
-
-          echo
-          echo "=========================================="
-          echo "             FINAL DIAGNOSIS"
-          echo "=========================================="
-
-          echo
-
-          if [ "$STATUS" = "200" ]; then
-            echo "✅ M3U8 endpoint is reachable"
-          else
-            echo "❌ M3U8 returned HTTP $STATUS"
-          fi
-
-          if [ -n "$CORS" ]; then
-            echo "✅ M3U8 CORS header exists"
-          else
-            echo "⚠️ M3U8 CORS header missing"
-          fi
-
-          echo
-
-          echo "Possible causes if authorized player works"
-          echo "but direct browser playback does not:"
-          echo
-          echo "1. Player/session authorization"
-          echo "2. Required cookie or session"
-          echo "3. Required Referer/Origin"
-          echo "4. Segment-level authorization"
-          echo "5. Browser codec compatibility"
-          echo "6. Player-specific configuration"
-          echo
-          echo "=========================================="
-          echo "Diagnostic finished"
-          echo "=========================================="
+          echo "API testing finished."
